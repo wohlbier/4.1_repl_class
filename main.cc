@@ -41,6 +41,9 @@ static inline
 Index_t r_map(Index_t i) { return i / NODELETS(); } // slow running index
 static inline
 Index_t n_map(Index_t i) { return i % NODELETS(); } // fast running index
+// view-2 pointer to nodelet holding row i
+static inline
+Vec_t ** nodelet_addr(Vec_t ** v, Index_t i) { return v + n_map(i); }
 
 void print_emu_ptr(std::string name, void * r)
 {
@@ -82,7 +85,7 @@ void pushBack(Vec_t ** v, Index_t row_idx)
 {
     pVec_t vecPtr = v[n_map(row_idx)] + r_map(row_idx);
 
-    for (Index_t i = 0; i < 3; ++i)
+    for (Index_t i = 0; i < 200; ++i)
     {
         // causes migrations to nodelet 0
         vecPtr->push_back(1);
@@ -108,6 +111,8 @@ int main(int argc, char* argv[])
     Vec_t ** v = cilk_spawn allocVecs(nvecs, nvecs_per_nodelet);
     cilk_sync;
 
+    // push_back will have a stack, need it to be created at target nodelet
+    cilk_migrate_hint(nodelet_addr(v, 15));
     cilk_spawn pushBack(v, 15);
     cilk_sync;
 
