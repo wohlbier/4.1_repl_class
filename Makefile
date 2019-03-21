@@ -8,8 +8,10 @@ EMU_CXX = $(EMU_PATH)/bin/emu-cc
 EMU_SIM = $(EMU_PATH)/bin/emusim.x
 EMU_SIM_OPTS = --short_trace
 
-EXE  = dot
+EXE  = stdvector
 EMU_EXE = $(EXE).mwx
+
+LDFLAGS = -lemu_c_utils
 
 $(EMU_EXE) : $(EMU_OBJS)
 	$(EMU_CXX) -o $(EMU_EXE) $(EMU_OBJS) $(LDFLAGS)

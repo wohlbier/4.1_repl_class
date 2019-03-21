@@ -23,62 +23,130 @@
   showing that no remote memory operations occurred.
  */
 
-#include <tuple>
+#include <string>
 #include <vector>
 
+#include <cilk.h>
 #include <memoryweb.h>
+extern "C" {
+#include <emu_c_utils/layout.h>
+}
 
 typedef long Index_t;
 typedef long Scalar_t;
-typedef std::vector<std::tuple<Index_t,Scalar_t>> Row_t;
-typedef Row_t * pRow_t;
+typedef std::vector<Scalar_t> Vec_t;
+typedef Vec_t * pVec_t;
 
+static inline
 Index_t r_map(Index_t i) { return i / NODELETS(); } // slow running index
+static inline
 Index_t n_map(Index_t i) { return i % NODELETS(); } // fast running index
+
+void print_emu_ptr(std::string name, void * r)
+{
+    emu_pointer pchk = examine_emu_pointer(r);
+
+    if (pchk.view == 2)
+    {
+        printf("emu ptr: %s view: %ld\n", name.c_str(), pchk.view);
+    }
+    else
+    {
+        printf("emu ptr: %s view: %ld, node_id: %ld, nodelet_id: %ld, "
+               "nodelet_addr: %ld, byte_offset: %ld\n",
+               name.c_str(),
+               pchk.view, pchk.node_id, pchk.nodelet_id, pchk.nodelet_addr,
+               pchk.byte_offset);
+    }
+}
+
+Vec_t ** allocVecs(Index_t nvecs, Index_t nvecs_per_nodelet)
+{
+    Vec_t ** v
+        = (Vec_t **)mw_malloc2d(NODELETS(),
+                                nvecs_per_nodelet * sizeof(Vec_t));
+
+    for (Index_t vec_idx = 0; vec_idx < nvecs; ++vec_idx)
+    {
+        size_t nid(n_map(vec_idx));
+        size_t rid(r_map(vec_idx));
+
+        // migrations to do placement new on other nodelets
+        pVec_t vecPtr = new(v[nid] + rid) Vec_t();
+    }
+
+    return v;
+}
+
+void pushBack(Vec_t ** v, Index_t row_idx)
+{
+    pVec_t vecPtr = v[n_map(row_idx)] + r_map(row_idx);
+
+    for (Index_t i = 0; i < 3; ++i)
+    {
+        // causes migrations to nodelet 0
+        vecPtr->push_back(1);
+    }
+
+    // shows that the pushed back data does live on nodelet 7
+    /*
+      print_emu_ptr("vecPtr", vecPtr);
+      print_emu_ptr("data 0", &vecPtr[0]);
+      print_emu_ptr("data 1", &vecPtr[1]);
+      print_emu_ptr("data 2", &vecPtr[2]);
+    */
+
+}
 
 int main(int argc, char* argv[])
 {
     starttiming();
 
-    Index_t nrows = 16;
-    Index_t nrows_per_nodelet = nrows + nrows % NODELETS();
+    Index_t nvecs = 16;
+    Index_t nvecs_per_nodelet = nvecs + nvecs % NODELETS();
 
-    // NB: r is a "view 2" pointer to a Row_t
-    //     r + 2 is an address on nodelet 2.
-    //     r[2] will migrate to node 2 and read the value at address r + 2
+    Vec_t ** v = cilk_spawn allocVecs(nvecs, nvecs_per_nodelet);
+    cilk_sync;
 
-    // MM: 124 memory references on nodelet 0.
-    // RM: 0+1 on all j nodelets (0,j) j=1...7
-    Row_t ** r
-        = (Row_t **)mw_malloc2d(NODELETS(),
-                                nrows_per_nodelet * sizeof(Row_t));
-
-    for (Index_t row_idx = 0; row_idx < nrows; ++row_idx)
-    {
-        size_t nid(n_map(row_idx));
-        size_t rid(r_map(row_idx));
-
-        // r_repl[nid][rid] is a Row_t
-        // r_repl[nid] + rid is address of Row_t's
-        // &r_repl[nid][rid] = r_repl[nid] + rid
-
-        // migrations to do placement new on other nodelets
-        pRow_t rowPtr = new(&r[nid][rid]) Row_t();
-    }
-
-    // Push stuff onto nodelet 0 vector
-    pRow_t rowPtr = &r[n_map(0)][r_map(0)];
-    rowPtr->push_back(std::make_tuple(0,1));
-    rowPtr->push_back(std::make_tuple(7,1));
-    rowPtr->push_back(std::make_tuple(12,1));
-    rowPtr->push_back(std::make_tuple(14,1));
-
-    // this is an address on nodlet 7
-    rowPtr = &r[n_map(15)][r_map(15)];
-
-    // including this line completely changes the migration pattern
-    // E. Hein guesses that this is stack spillage.
-    rowPtr->push_back(std::make_tuple(1,1));
+    cilk_spawn pushBack(v, 15);
+    cilk_sync;
 
     return 0;
 }
+
+
+/*
+  yes, they return a view-2 "striped" pointer, as opposed to a view-1
+  "absolute" or view-0 "relative" pointer. We reserve some of the high bits
+  to store the view number. The hardware checks this and uses it to determine
+  where to pull the nodelet bits from. View-2 is implemented by moving the
+  nodelet ID lower in the pointer, so standard pointer arithmetic actually
+  changes the nodelet ID.
+  and I have to be pedantic here because it's easy to get confused.
+  `ptr + 1` _refers_ to a location on nodelet 1, but the pointer itself could
+  be stored elsewhere.
+
+  Right, all of this is to help me understand the trick with replicating the
+  base pointer. In that case, `ptr` is an address on, say, nodelet 0
+  (presumably also stored at an address on nodelet 0) and `ptr + 1` is thereby
+  "stored" on nodelet 0, but resulting address is on nodelet 1. Easy to get
+  confused indeed
+
+  right so lets apply this to `mw_malloc2D`
+
+  `long ** ptr = mw_malloc2d(NODELETS(), 10 * sizeof(long));` Let's assume 8
+  nodelets for simplicity. So we have a striped array of pointers to arrays
+  on each nodelet.
+  - `&ptr` is a view-1 pointer to to the local variable ptr, which is on the
+  current nodelet (probably nodelet 0)
+  - `ptr` is view-2
+  - `&ptr[2]` is a view-1 pointer that refers to nodelet 2.
+  - `ptr[2]` could be rewritten as `*(ptr + 2)`, during evaluation we will
+  migrate to nodelet 2 to read the view-1 pointer stored there
+  - `ptr[2][3]` We migrate to nodelet 2 to read the view-1 pointer stored on
+  nodelet 2 at `&ptr[2]`, then index again to reach a location in the block on
+  nodelet 2
+  so getting back to replication, we want to be able to start the process from
+  any nodelet without migrating back to nodelet 0 where `ptr` is stored. So
+  make `&ptr` be view-0 using `replicated`.
+*/
