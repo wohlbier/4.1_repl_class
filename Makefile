@@ -6,7 +6,6 @@ EMU_OBJS = $(subst .cc,.emu.o,$(SRCS))
 EMU_PATH = /home/jgwohlbier/devel/packages/emu-19.02
 EMU_CXX = $(EMU_PATH)/bin/emu-cc
 EMU_SIM = $(EMU_PATH)/bin/emusim.x
-EMU_PROFILE = $(EMU_PATH)/bin/emu
 
 EMU_SIM_ARGS =
 #EMU_SIM_ARGS += --short_trace
@@ -35,3 +34,4 @@ profile : $(EMU_EXE)
 
 clean :
 	-$(RM) *~ $(OBJS) $(EMU_OBJS) $(EXE) $(EMU_EXE) *.cdc *.hdd *.vsf
+	-$(RM) -rf profile
