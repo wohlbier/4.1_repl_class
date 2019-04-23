@@ -128,7 +128,6 @@ private:
     ppRow_t rows_;
 };
 
-
 int main(int argc, char* argv[])
 {
     starttiming();
