@@ -148,7 +148,7 @@ int main(int argc, char* argv[])
     Index_t row_idx_1 = 2; // row on nodelet 2
     cilk_migrate_hint(A->nodelet_addr(row_idx_1));
     // adds one migration  0 => 2
-    // adds two migrations 2 => 0
+    // adds two migrations 2 => 0, main thread and spawned thread
     cilk_spawn A->build(row_idx_1);
     /*
       MEMORY MAP
@@ -164,8 +164,8 @@ int main(int argc, char* argv[])
 
     Index_t row_idx_2 = 13; // row on nodelet 5
     cilk_migrate_hint(B->nodelet_addr(row_idx_2));
-    // adds one migration 2 => 5
-    // adds one migration 5 => 2
+    // adds one migration 2 => 5    // NEEDS EXPLANATION
+    // adds one migration 5 => 2    // NEEDS EXPLANATION
     // adds one migration 5 => 0
     cilk_spawn B->build(row_idx_2);
     /*
