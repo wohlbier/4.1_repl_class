@@ -4,12 +4,20 @@
 
 #include <cilk.h>
 #include <memoryweb.h>
+#include <distributed.h>
 extern "C" {
 #include <emu_c_utils/layout.h>
+#include <emu_c_utils/hooks.h>
 }
 
 typedef long Index_t;
 typedef long Scalar_t;
+typedef std::vector<std::tuple<Index_t, Scalar_t>> Row_t;
+typedef Row_t * pRow_t;
+typedef pRow_t * ppRow_t;
+
+static inline Index_t n_map(Index_t i) { return i % NODELETS(); }
+static inline Index_t r_map(Index_t i) { return i / NODELETS(); }
 
 /*
  * Overrides default new to always allocate replicated storage for instances
@@ -34,10 +42,6 @@ public:
         mw_free(ptr);
     }
 };
-
-typedef std::vector<std::tuple<Index_t, Scalar_t>> Row_t;
-typedef Row_t * pRow_t;
-typedef pRow_t * ppRow_t;
 
 class Matrix_t : public repl_new
 {
@@ -81,7 +85,7 @@ public:
         }
         
         // bc of replication this does not cause migration
-        pRow_t rowPtr = rows_[row_idx];
+        pRow_t rowPtr = rows_[n_map(row_idx)] + r_map(row_idx);
         
         for (Row_t::iterator it = tmpRow.begin(); it < tmpRow.end(); ++it)
         {
@@ -91,16 +95,16 @@ public:
 
     Index_t * nodelet_addr(Index_t i)
     {
-        // dereferencing causes migrations
-        return (Index_t *)(rows_ + i);
+      // dereferencing causes migrations
+      return (Index_t *)(rows_ + n_map(i));
     }
     
 private:
     Matrix_t(Index_t nrows) : nrows_(nrows)
     {
-        nrows_per_nodelet_ = nrows_ + nrows_ % NODELETS();
-
-        rows_ = (ppRow_t)mw_malloc1dlong(nrows_);
+        nrows_per_nodelet_ = r_map(nrows_) + n_map(nrows_); 
+        rows_ = (ppRow_t)mw_malloc2d(NODELETS(),
+                                     nrows_per_nodelet_ * sizeof(Row_t));
 
         // replicate the class across nodelets
         for (Index_t i = 1; i < NODELETS(); ++i)
@@ -109,18 +113,21 @@ private:
         }
 
         // local mallocs on each nodelet
-        for (Index_t i = 0; i < nrows_; ++i)
+        for (Index_t i = 0; i < NODELETS(); ++i)
         {
             cilk_migrate_hint(rows_ + i);
-            cilk_spawn allocateRow(i);
+            cilk_spawn allocateRows(i);
         }
         cilk_sync;
     }
 
     // localalloc a single row
-    void allocateRow(Index_t i)
+    void allocateRows(Index_t i)
     {
-        rows_[i] = new Row_t(); // allocRow must be spawned on correct nlet
+        for (Index_t row_idx= 0; row_idx < nrows_per_nodelet_; ++row_idx)
+        {
+            new(rows_[i] + row_idx) Row_t();
+        }
     }
 
     Index_t nrows_;
@@ -130,56 +137,113 @@ private:
 
 int main(int argc, char* argv[])
 {
-    starttiming();
-
     Index_t nrows = 16;
+    hooks_region_begin("GBTL_Matrix_Build");
 
-    // 2 migrations from:     0 => 1...7  (round robin)
-    // 4 migrations from: 1...7 => 0
-    // - 2 from main thread returning from each nodelet
-    // - 2 from each spawned thread returning from each nodelet
+    /*
+    Nodelets start at 0 and end at 7
+    Matrix A will have 2 rows per nodelet, total 2RowsX8Nodelets
+    
+    Expected Migration:
+    	Thread 0 migrates to each nodelet, spawns 1 thread and returns back to nodelet 0.
+    	Spawned thread does the allocation for all rows in its current spawned nodelet
+    	and return to nodelet 0.
+        So in total there is one migration on each 0..1, 0..2, ..... 0..7 and another for 
+        each 1..0, 2..0, ....., 7..0 the spawned threads on each nodelet migrate back to 0.
+        ie. 1..0, ..... ,7..0 
+
+    Cause: 
+    	cilk_migrate_hint(rows_ + i) informs the runtime that the next thread should be
+        spawned on the nodelet that contains address "rows_ + i".
+        So the main thread migrates to that nodelet and then spawns a thread.
+    */
+
     Matrix_t * A = Matrix_t::create(nrows);
 
-    // double migrations from above
-    // 4 migrations from:     0 => 1...7
-    // 8 migrations from: 1...7 => 0
-    Matrix_t * B = Matrix_t::create(nrows);
+    /*
+    Resulting Memory Map at this stage
+    6675,1,1,1,1,1,1,1
+    2,10,0,0,0,0,0,0
+    2,0,10,0,0,0,0,0
+    2,0,0,10,0,0,0,0
+    2,0,0,0,10,0,0,0
+    2,0,0,0,0,10,0,0
+    2,0,0,0,0,0,10,0
+    2,0,0,0,0,0,0,10
+    */
 
-    Index_t row_idx_1 = 2; // row on nodelet 2
+    /*
+    Matrix B will have 2 rows per nodelet, total 2RowsX8Nodelets
+    
+    Same expected Migration and Cause as before. Just doubles for the new Matrix
+    */
+
+    Matrix_t * B = Matrix_t::create(nrows);
+    
+    /*
+    Resulting Memory Map at this stage
+    7246,2,2,2,2,2,2,2
+    4,20,0,0,0,0,0,0
+    4,0,20,0,0,0,0,0
+    4,0,0,20,0,0,0,0
+    4,0,0,0,20,0,0,0
+    4,0,0,0,0,20,0,0
+    4,0,0,0,0,0,20,0
+    4,0,0,0,0,0,0,20
+    */
+
+    Index_t row_idx_1 = 2; // Build at 1st row in 2nd nodelet
+    /*
+    Expected Migration:
+	The last spawned thread from allocRows migrates to nodelet 2 
+        and spawns a build function at nodelet 2.
+        Hence there is one additional migration from 0..2 and two
+        additional migrations from 2..0
+    Cause:
+	because of the cilk_migrate_hint at nodelet 2
+    */
     cilk_migrate_hint(A->nodelet_addr(row_idx_1));
-    // adds one migration  0 => 2
-    // adds two migrations 2 => 0, main thread and spawned thread
     cilk_spawn A->build(row_idx_1);
     /*
-      MEMORY MAP
-      2359,4,5,4,4,4,4,4
-      8,234,0,0,0,0,0,0
-      10,0,1556,0,0,0,0,0
-      8,0,0,234,0,0,0,0
-      8,0,0,0,234,0,0,0
-      8,0,0,0,0,234,0,0
-      8,0,0,0,0,0,234,0
-      8,0,0,0,0,0,0,234
-    */
+    Resulting Memory Map at this stage:
+    7282,2,3,2,2,2,2,2
+    4,20,0,0,0,0,0,0
+    6,0,1381,0,0,0,0,0
+    4,0,0,20,0,0,0,0
+    4,0,0,0,20,0,0,0
+    4,0,0,0,0,20,0,0
+    4,0,0,0,0,0,20,0
+    4,0,0,0,0,0,0,20
+   */
 
-    Index_t row_idx_2 = 13; // row on nodelet 5
-    cilk_migrate_hint(B->nodelet_addr(row_idx_2));
-    // adds one migration 2 => 5    // NEEDS EXPLANATION
-    // adds one migration 5 => 2    // NEEDS EXPLANATION
-    // adds one migration 5 => 0
-    cilk_spawn B->build(row_idx_2);
+    Index_t row_idx_2 = 13; // Build at 2nd row in 5th nodelet
     /*
-      2332,4,5,4,4,4,4,4
-      8,234,0,0,0,0,0,0
-      10,0,1607,0,0,1,0,0
-      8,0,0,234,0,0,0,0
-      8,0,0,0,234,0,0,0
-      9,0,1,0,0,1513,0,0
-      8,0,0,0,0,0,234,0
-      8,0,0,0,0,0,0,234
+    Expected Migration:
+	The last spawned thread from allocRows migrates to nodelet 5 
+        and spawns a build function at nodelet 5
+        Hence there is one additional migration from 0..5 and two
+        additional migrations from 5..0
+    Cause:
+	because of the cilk_migrate_hint at nodelet 5
     */
-
+    cilk_migrate_hint(B->nodelet_addr(row_idx_2));
+    cilk_spawn B->build(row_idx_2);
     cilk_sync;
-    
+
+    /*
+    Resulting Memory Map at end of the program:
+    7323,2,3,2,2,3,2,2
+    4,20,0,0,0,0,0,0
+    6,0,1381,0,0,0,0,0
+    4,0,0,20,0,0,0,0
+    4,0,0,0,20,0,0,0
+    6,0,0,0,0,1338,0,0
+    4,0,0,0,0,0,20,0
+    4,0,0,0,0,0,0,20
+   */
+
+    hooks_region_end();
+
     return 0;
 }
+
